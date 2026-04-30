@@ -18,7 +18,6 @@ from .context_window_detection import detect_context_window
 from .env_store import get_env_store
 from .model_catalog import get_model_catalog_service
 from .provider_runtime import (
-    EMBEDDING_PROVIDERS,
     resolve_embedding_runtime_config,
     resolve_llm_runtime_config,
     resolve_search_runtime_config,
@@ -340,29 +339,30 @@ class ConfigTestRunner:
         run.emit(
             "info", f"Resolved embedding model `{config.model}` with binding `{config.binding}`."
         )
-        # URL semantics differ by adapter family:
-        # * `openai_sdk`  → AsyncOpenAI auto-appends `/embeddings` to base_url
-        # * everything else (openai_compat / cohere / jina / ollama / dashscope)
-        #   → POSTs to `base_url` verbatim
-        spec = EMBEDDING_PROVIDERS.get(config.binding)
-        url_note = (
-            "OpenAI SDK appends `/embeddings`"
-            if spec and spec.adapter == "openai_sdk"
-            else "POSTed verbatim, no path appending"
+        run.emit(
+            "info",
+            f"Request target (POSTed exactly as shown in Settings): {config.base_url}",
         )
         run.emit(
             "info",
-            f"Request target ({url_note}): {config.base_url}",
-        )
-        run.emit(
-            "info",
-            "Probing native max dimension (sending no `dimensions=` param).",
+            "Probing native max dimension with a small batch (sending no `dimensions=` param).",
         )
         client = EmbeddingClient(config)
-        vectors = await client.embed(["DeepTutor embedding smoke test"])
-        if not vectors or not vectors[0]:
+        probe_texts = [
+            "DeepTutor embedding smoke test",
+            "DeepTutor retrieval batch probe",
+        ]
+        vectors = await client.embed(probe_texts)
+        if len(vectors) != len(probe_texts):
+            raise ValueError(
+                "Embedding service returned an unexpected number of vectors "
+                f"(expected {len(probe_texts)}, got {len(vectors)})."
+            )
+        if any(not vector for vector in vectors):
             raise ValueError("Embedding service returned an empty vector.")
         detected_dim = len(vectors[0])
+        if any(len(vector) != detected_dim for vector in vectors):
+            raise ValueError("Embedding service returned inconsistent vector dimensions.")
 
         capabilities = self._capabilities_from_adapter(client.adapter, config.model)
         supported = capabilities["supported_dimensions"]

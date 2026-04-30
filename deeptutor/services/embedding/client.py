@@ -5,25 +5,14 @@ from __future__ import annotations
 from typing import List, Optional
 
 from deeptutor.logging import get_logger
-from deeptutor.services.config.provider_runtime import EMBEDDING_PROVIDERS
+from deeptutor.services.config.provider_runtime import (
+    EMBEDDING_PROVIDERS,
+    embedding_endpoint_validation_error,
+)
 
-from .adapters.base import BaseEmbeddingAdapter, EmbeddingRequest
-from .adapters.cohere import CohereEmbeddingAdapter
-from .adapters.dashscope_native import DashScopeMultiModalEmbeddingAdapter
-from .adapters.jina import JinaEmbeddingAdapter
-from .adapters.ollama import OllamaEmbeddingAdapter
-from .adapters.openai_compatible import OpenAICompatibleEmbeddingAdapter
-from .adapters.openai_sdk import OpenAISDKEmbeddingAdapter
+from .adapters import ADAPTER_BACKENDS, BaseEmbeddingAdapter, EmbeddingRequest
 from .config import EmbeddingConfig, get_embedding_config
-
-_ADAPTER_MAP: dict[str, type[BaseEmbeddingAdapter]] = {
-    "openai_compat": OpenAICompatibleEmbeddingAdapter,
-    "openai_sdk": OpenAISDKEmbeddingAdapter,
-    "cohere": CohereEmbeddingAdapter,
-    "jina": JinaEmbeddingAdapter,
-    "ollama": OllamaEmbeddingAdapter,
-    "dashscope_native": DashScopeMultiModalEmbeddingAdapter,
-}
+from .validation import validate_embedding_batch
 
 
 def _resolve_adapter_class(binding: str) -> type[BaseEmbeddingAdapter]:
@@ -34,7 +23,7 @@ def _resolve_adapter_class(binding: str) -> type[BaseEmbeddingAdapter]:
         raise ValueError(
             f"Unknown embedding binding: '{binding}'. Supported: {', '.join(supported)}"
         )
-    cls = _ADAPTER_MAP.get(spec.adapter)
+    cls = ADAPTER_BACKENDS.get(spec.adapter)
     if cls is None:
         raise ValueError(
             f"No adapter registered for backend '{spec.adapter}' (binding='{binding}')"
@@ -48,6 +37,14 @@ class EmbeddingClient:
     def __init__(self, config: Optional[EmbeddingConfig] = None):
         self.config = config or get_embedding_config()
         self.logger = get_logger("EmbeddingClient")
+        endpoint = self.config.effective_url or self.config.base_url
+        problem = embedding_endpoint_validation_error(self.config.binding, endpoint)
+        if problem:
+            raise ValueError(
+                f"{problem} Current Settings endpoint is {endpoint!r}. "
+                "DeepTutor sends embedding requests to the Settings URL exactly; "
+                "update the visible Endpoint URL instead of relying on hidden path appending."
+            )
         adapter_class = _resolve_adapter_class(self.config.binding)
         self.adapter = adapter_class(
             {
@@ -86,6 +83,7 @@ class EmbeddingClient:
             )
         all_embeddings: List[List[float]] = []
         batch_delay = self.config.batch_delay
+        expected_dim: int | None = None
 
         total_batches = (len(texts) + batch_size - 1) // batch_size
         for i, start in enumerate(range(0, len(texts), batch_size)):
@@ -113,7 +111,28 @@ class EmbeddingClient:
                     f"{traceback.format_exc()}"
                 )
                 raise
-            all_embeddings.extend(response.embeddings)
+            validated = validate_embedding_batch(
+                response.embeddings,
+                expected_count=len(batch),
+                binding=self.config.binding,
+                model=self.config.model,
+                batch_index=i + 1,
+                total_batches=total_batches,
+                start_index=start,
+            )
+            batch_dim = len(validated[0]) if validated else 0
+            if expected_dim is None:
+                expected_dim = batch_dim
+            elif batch_dim != expected_dim:
+                raise ValueError(
+                    "Embedding provider returned inconsistent vector dimensions "
+                    f"across batches (binding={self.config.binding}, "
+                    f"model={self.config.model}): expected {expected_dim}, "
+                    f"got {batch_dim} in batch {i + 1}/{total_batches}. "
+                    "Use a single embedding model/dimension and re-index the knowledge base."
+                )
+
+            all_embeddings.extend(validated)
 
             # Report progress after each batch
             if progress_callback:
@@ -159,8 +178,9 @@ _client: Optional[EmbeddingClient] = None
 
 def get_embedding_client(config: Optional[EmbeddingConfig] = None) -> EmbeddingClient:
     global _client
-    if _client is None:
-        _client = EmbeddingClient(config)
+    resolved_config = config or get_embedding_config()
+    if _client is None or _client.config != resolved_config:
+        _client = EmbeddingClient(resolved_config)
     return _client
 
 
